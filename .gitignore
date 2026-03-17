@@ -1,3 +1,6 @@
 scrapper-be/node_modules
 scrapper-be/.env
 scrapper-fe/node_modules
+
+heredeepBeScrape/node_modules
+heredeepFeScrape/visual-scraper-frontend-js/node_modules
