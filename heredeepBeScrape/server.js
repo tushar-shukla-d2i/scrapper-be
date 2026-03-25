@@ -12,36 +12,28 @@ app.use(cors({
   origin: 'http://localhost:3000',
   credentials: true
 }));
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Health check endpoint
+// ─── Health check ────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Server is running' });
 });
 
-// Proxy endpoint - Handle both GET and POST
+// ─── Proxy endpoint ──────────────────────────────────────────────────────────
 app.all('/api/proxy', async (req, res) => {
   try {
-    // Get URL from query string (GET) or body (POST)
-    // const url = req.method === 'GET' ? req.query.url : req.body.url;
-    const url =  req.query.url ||  req.body.url;
-    console.log(url,"here url")
-    
-    if (!url) {
-      return res.status(400).json({ error: 'URL is required' });
+    const url = req.query.url || req.body.url;
+    console.log(url, "here url");
+
+    if (!url) return res.status(400).json({ error: 'URL is required' });
+
+    try { new URL(url); } catch (e) {
+      return res.status(400).json({ error: 'Invalid URL format' });
     }
 
     console.log(`[${req.method}] Fetching:`, url);
 
-    // Validate URL
-    try {
-      new URL(url);
-    } catch (e) {
-      return res.status(400).json({ error: 'Invalid URL format' });
-    }
-
-    // Fetch the website with better error handling
     const response = await axios.get(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -53,26 +45,16 @@ app.all('/api/proxy', async (req, res) => {
       },
       maxRedirects: 5,
       timeout: 30000,
-      validateStatus: function (status) {
-        return status < 500; // Accept all status codes below 500
-      }
+      validateStatus: (status) => status < 500
     });
 
-    // Check if response is HTML
     const contentType = response.headers['content-type'] || '';
-    if (!contentType.includes('text/html')) {
-      // If not HTML, return as is
-      return res.send(response.data);
-    }
+    if (!contentType.includes('text/html')) return res.send(response.data);
 
-    // Inject our selector tool script into the HTML
     let html = response.data;
-    
-    // Add base tag to handle relative URLs
     const baseUrl = new URL(url).origin;
     html = html.replace('<head>', `<head><base href="${baseUrl}/">`);
-    
-    // Inject our selector tool CSS and JS
+
     const selectorTool = `
       <style>
         #scraper-highlight {
@@ -109,19 +91,9 @@ app.all('/api/proxy', async (req, res) => {
           max-width: 300px;
           display: none;
         }
-        .scraper-instructions.active {
-          display: block;
-        }
-        .scraper-instructions h4 {
-          margin: 0 0 8px 0;
-          color: #2d3748;
-          font-size: 14px;
-        }
-        .scraper-instructions p {
-          margin: 0;
-          color: #4a5568;
-          font-size: 12px;
-        }
+        .scraper-instructions.active { display: block; }
+        .scraper-instructions h4 { margin: 0 0 8px 0; color: #2d3748; font-size: 14px; }
+        .scraper-instructions p  { margin: 0; color: #4a5568; font-size: 12px; }
       </style>
       <div class="scraper-instructions" id="scraper-instructions">
         <h4>🔍 Select Mode Active</h4>
@@ -129,334 +101,281 @@ app.all('/api/proxy', async (req, res) => {
       </div>
       <script>
         (function() {
-          // Create highlight elements
           const highlightBox = document.createElement('div');
           highlightBox.id = 'scraper-highlight';
           document.body.appendChild(highlightBox);
-          
+
           const tooltip = document.createElement('div');
           tooltip.id = 'scraper-tooltip';
           document.body.appendChild(tooltip);
-          
+
           const instructions = document.getElementById('scraper-instructions');
-          
           let isSelectMode = false;
-          
-          // Listen for select mode changes from parent
+
           window.addEventListener('message', (event) => {
             if (event.data.type === 'SET_SELECT_MODE') {
               isSelectMode = event.data.value;
-              if (instructions) {
-                instructions.classList.toggle('active', isSelectMode);
-              }
+              if (instructions) instructions.classList.toggle('active', isSelectMode);
               if (!isSelectMode) {
                 highlightBox.style.display = 'none';
                 tooltip.style.display = 'none';
               }
             }
           });
-          
-          // Generate CSS selector
+
           function getSelector(el) {
             if (!el) return '';
-            
             if (el.id) return '#' + CSS.escape(el.id);
-            
             let path = [];
             let current = el;
-            
             while (current && current !== document.body) {
               let selector = current.tagName.toLowerCase();
-              
               if (current.className && typeof current.className === 'string') {
                 const classes = current.className.split(/\\s+/).filter(c => c && c.trim());
-                if (classes.length > 0) {
-                  selector += '.' + CSS.escape(classes[0]);
-                }
+                if (classes.length > 0) selector += '.' + CSS.escape(classes[0]);
               }
-              
-              // Add :nth-child for uniqueness
               const parent = current.parentElement;
               if (parent) {
                 const siblings = Array.from(parent.children);
                 const index = siblings.indexOf(current) + 1;
-                if (siblings.length > 1) {
-                  selector += ':nth-child(' + index + ')';
-                }
+                if (siblings.length > 1) selector += ':nth-child(' + index + ')';
               }
-              
               path.unshift(selector);
               current = current.parentElement;
             }
-            
             return path.join(' > ');
           }
-          
-          // Handle mouseover for highlighting
+
           document.addEventListener('mouseover', (e) => {
             if (!isSelectMode) return;
-            
             const target = e.target;
             if (target === highlightBox || target === tooltip || target === instructions) return;
-            
             const rect = target.getBoundingClientRect();
             const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
             const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
-            
             highlightBox.style.display = 'block';
-            highlightBox.style.top = (rect.top + scrollTop) + 'px';
-            highlightBox.style.left = (rect.left + scrollLeft) + 'px';
-            highlightBox.style.width = rect.width + 'px';
+            highlightBox.style.top    = (rect.top  + scrollTop)  + 'px';
+            highlightBox.style.left   = (rect.left + scrollLeft) + 'px';
+            highlightBox.style.width  = rect.width  + 'px';
             highlightBox.style.height = rect.height + 'px';
-            
-            // Show tooltip with tag name
             tooltip.style.display = 'block';
-            tooltip.style.top = (rect.top + scrollTop - 25) + 'px';
-            tooltip.style.left = (rect.left + scrollLeft) + 'px';
+            tooltip.style.top  = (rect.top  + scrollTop  - 25) + 'px';
+            tooltip.style.left = (rect.left + scrollLeft)       + 'px';
             tooltip.textContent = '<' + target.tagName.toLowerCase() + '>';
           });
-          
-          // Handle click for selection
+
           document.addEventListener('click', (e) => {
             if (!isSelectMode) return;
-            
             e.preventDefault();
             e.stopPropagation();
-            
             const target = e.target;
-            
-            // Get element info
-            const elementInfo = {
-              tag: target.tagName.toLowerCase(),
-              id: target.id || undefined,
-              classes: Array.from(target.classList || []),
-              name: target.getAttribute('name'),
-              type: target.getAttribute('type'),
-              text: target.innerText?.slice(0, 100),
-              value: target.value,
-              href: target.href,
-              placeholder: target.getAttribute('placeholder'),
-              selector: getSelector(target)
-            };
-            
-            // Get all attributes
             const attributes = {};
             if (target.attributes) {
               Array.from(target.attributes).forEach(attr => {
                 attributes[attr.name] = attr.value;
               });
             }
-            elementInfo.attributes = attributes;
-            
-            // Send to parent
-            window.parent.postMessage({
-              type: 'ELEMENT_SELECTED',
-              data: elementInfo
-            }, '*');
-            
-            // Flash the element to indicate selection
+            const elementInfo = {
+              tag:         target.tagName.toLowerCase(),
+              id:          target.id || undefined,
+              classes:     Array.from(target.classList || []),
+              name:        target.getAttribute('name'),
+              type:        target.getAttribute('type'),
+              text:        target.innerText?.slice(0, 100),
+              value:       target.value,
+              href:        target.href,
+              placeholder: target.getAttribute('placeholder'),
+              selector:    getSelector(target),
+              attributes
+            };
+            window.parent.postMessage({ type: 'ELEMENT_SELECTED', data: elementInfo }, '*');
             const originalOutline = target.style.outline;
             target.style.outline = '2px solid #48bb78';
-            setTimeout(() => {
-              target.style.outline = originalOutline;
-            }, 200);
+            setTimeout(() => { target.style.outline = originalOutline; }, 200);
           }, true);
-          
-          // Prevent form submissions in select mode
+
           document.addEventListener('submit', (e) => {
-            if (isSelectMode) {
-              e.preventDefault();
-              e.stopPropagation();
-              console.log('Form submission prevented in select mode');
-            }
+            if (isSelectMode) { e.preventDefault(); e.stopPropagation(); }
           }, true);
-          
-          // Prevent link clicks in select mode
+
           document.addEventListener('click', (e) => {
-            if (isSelectMode && e.target.tagName === 'A') {
-              e.preventDefault();
-              console.log('Link click prevented in select mode');
-            }
+            if (isSelectMode && e.target.tagName === 'A') e.preventDefault();
           }, true);
-          
-          // Notify parent that we're ready
+
           window.parent.postMessage({ type: 'IFRAME_READY' }, '*');
           console.log('Selector tool injected successfully');
         })();
       </script>
     `;
-    
-    // Inject the script right before </body>
+
     if (html.includes('</body>')) {
       html = html.replace('</body>', selectorTool + '</body>');
     } else {
       html = html + selectorTool;
     }
-    
+
     res.send(html);
-    
+
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
-    // Send a user-friendly error page
     res.status(500).send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
+      <!DOCTYPE html><html><head>
         <style>
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f7fafc;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-          }
-          .error-container {
-            background: white;
-            border-radius: 12px;
-            padding: 32px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
-            max-width: 500px;
-            text-align: center;
-          }
-          .error-icon {
-            font-size: 48px;
-            margin-bottom: 16px;
-          }
-          h2 {
-            color: #e53e3e;
-            margin: 0 0 16px 0;
-          }
-          p {
-            color: #4a5568;
-            margin: 8px 0;
-            line-height: 1.6;
-          }
-          .error-details {
-            background: #fef2f2;
-            border: 1px solid #fecaca;
-            border-radius: 8px;
-            padding: 12px;
-            margin: 20px 0;
-            font-family: monospace;
-            font-size: 14px;
-            color: #991b1b;
-            text-align: left;
-            word-break: break-word;
-          }
-          button {
-            background: #3182ce;
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-size: 16px;
-            cursor: pointer;
-            transition: background 0.2s;
-          }
-          button:hover {
-            background: #2c5282;
-          }
+          body { font-family: sans-serif; background:#f7fafc; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+          .box { background:white; border-radius:12px; padding:32px; box-shadow:0 10px 25px rgba(0,0,0,0.1); max-width:500px; text-align:center; }
+          h2 { color:#e53e3e; } p { color:#4a5568; }
+          .err { background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:12px; margin:20px 0; font-family:monospace; font-size:14px; color:#991b1b; text-align:left; word-break:break-word; }
+          button { background:#3182ce; color:white; border:none; padding:12px 24px; border-radius:8px; font-size:16px; cursor:pointer; }
         </style>
-      </head>
-      <body>
-        <div class="error-container">
-          <div class="error-icon">😵</div>
+      </head><body>
+        <div class="box">
+          <div style="font-size:48px">😵</div>
           <h2>Failed to Load Website</h2>
-          <p>We couldn't load the requested website.</p>
-          <div class="error-details">
-            ${error.message}
-          </div>
-          <p style="font-size: 14px; color: #718096;">This might be due to:</p>
-          <ul style="text-align: left; color: #4a5568; font-size: 14px;">
-            <li>The website blocking automated access</li>
-            <li>Network connectivity issues</li>
-            <li>The website requiring authentication</li>
-          </ul>
-          <button onclick="window.parent.postMessage({ type: 'CLOSE_ERROR' }, '*')">
-            Close
-          </button>
+          <div class="err">${error.message}</div>
+          <button onclick="window.parent.postMessage({type:'CLOSE_ERROR'},'*')">Close</button>
         </div>
-      </body>
-      </html>
+      </body></html>
     `);
   }
 });
 
-// Login endpoint for handling form submissions
-app.post('/api/login', async (req, res) => {
+// ─── RUN endpoint ─────────────────────────────────────────────────────────────
+app.post('/api/run', async (req, res) => {
+  const { url, steps = [], extractionFields = [] } = req.body;
+
+  if (!url) return res.status(400).json({ error: 'URL is required' });
+
+  console.log(`\n▶ /api/run  url=${url}  steps=${steps.length}  fields=${extractionFields.length}`);
+
+  let browser;
   try {
-    const { url, email, password } = req.body;
-    
-    if (!url || !email || !password) {
-      return res.status(400).json({ error: 'URL, email, and password are required' });
-    }
-    
-    console.log('Processing login for:', url);
-    
-    // Use Puppeteer to handle the login
-    const browser = await puppeteer.launch({ 
-      headless: false, // Set to true in production
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    browser = await puppeteer.launch({
+      headless: false,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      defaultViewport: { width: 1280, height: 800 }
     });
-    
+
     const page = await browser.newPage();
-    
-    // Set viewport
-    await page.setViewport({ width: 1280, height: 800 });
-    
-    // Navigate to login page
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-    
-    // Wait for email field
-    await page.waitForSelector('input[type="email"], input[name="email"], input[name="username"]', { timeout: 10000 });
-    
-    // Fill in the form
-    await page.type('input[type="email"], input[name="email"], input[name="username"]', email);
-    await page.type('input[type="password"]', password);
-    
-    // Click login button
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-      page.click('button[type="submit"], input[type="submit"]')
-    ]);
-    
-    // Get the final URL and page content
-    const finalUrl = page.url();
-    const title = await page.title();
-    const screenshot = await page.screenshot({ encoding: 'base64' });
-    
-    await browser.close();
-    
-    res.json({ 
-      success: true, 
-      url: finalUrl,
-      title: title,
-      screenshot: screenshot,
-      message: 'Login successful!'
-    });
-    
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    console.log('  → navigating to', url);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const { action, selector, value, waitMs } = step;
+      console.log(`  step [${i + 1}] ${action}  selector=${selector}  value=${value}`);
+
+      try {
+        switch (action) {
+          case 'click':
+            await page.waitForSelector(selector, { timeout: 10000 });
+            await page.click(selector);
+            break;
+
+          case 'type':
+            await page.waitForSelector(selector, { timeout: 10000 });
+            await page.click(selector, { clickCount: 3 });
+            await page.type(selector, value || '', { delay: 40 });
+            break;
+
+          case 'select':
+            await page.waitForSelector(selector, { timeout: 10000 });
+            await page.select(selector, value || '');
+            break;
+
+          case 'scroll':
+            if (selector) {
+              await page.waitForSelector(selector, { timeout: 10000 });
+              await page.$eval(selector, el => el.scrollIntoView());
+            } else {
+              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            }
+            break;
+
+          case 'wait':
+            if (selector) {
+              await page.waitForSelector(selector, { timeout: 15000 });
+            } else {
+              await page.waitForTimeout(waitMs || 1000);
+            }
+            break;
+
+          case 'wait_timeout':
+            await page.waitForTimeout(Number(value) || 1000);
+            break;
+
+          case 'hover':
+            await page.waitForSelector(selector, { timeout: 10000 });
+            await page.hover(selector);
+            break;
+
+          case 'press':
+            await page.keyboard.press(value || 'Enter');
+            break;
+
+          default:
+            console.warn(`  unknown action: ${action} — skipping`);
+        }
+
+        await page.waitForTimeout(300);
+
+      } catch (stepErr) {
+        console.error(`  step [${i + 1}] failed: ${stepErr.message}`);
+      }
+    }
+
+    let results = [];
+
+    if (extractionFields.length > 0) {
+      console.log('  → extracting', extractionFields.length, 'field(s)');
+      await page.waitForTimeout(500);
+
+      results = await page.evaluate((fields) => {
+        const record = {};
+        fields.forEach(({ fieldName, selector, attr }) => {
+          try {
+            const el = document.querySelector(selector);
+            if (!el) { record[fieldName] = null; return; }
+            if (attr === 'href')       record[fieldName] = el.href || el.getAttribute('href');
+            else if (attr === 'src')   record[fieldName] = el.src  || el.getAttribute('src');
+            else if (attr)             record[fieldName] = el.getAttribute(attr);
+            else                       record[fieldName] = el.innerText?.trim() || el.textContent?.trim();
+          } catch (e) {
+            record[fieldName] = null;
+          }
+        });
+        return [record];
+      }, extractionFields);
+
+    } else {
+      const bodyText = await page.evaluate(() => document.body.innerText?.slice(0, 5000));
+      results = [{ page_text: bodyText }];
+    }
+
+    console.log(`  ✓ extracted ${results.length} record(s)`);
+    res.json({ success: true, results, total: results.length });
+
+  } catch (err) {
+    console.error('Run error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (browser) {
+      await browser.close();
+      console.log('  browser closed');
+    }
   }
 });
 
-// Test endpoint
+// ─── Test endpoint ───────────────────────────────────────────────────────────
 app.get('/api/test', (req, res) => {
-  res.json({ 
-    message: 'Backend is working!', 
-    timestamp: new Date().toISOString() 
-  });
+  res.json({ message: 'Backend is working!', timestamp: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
   console.log(`✅ Proxy server running on http://localhost:${PORT}`);
-  console.log(`📍 Test endpoint: http://localhost:${PORT}/api/test`);
-  console.log(`📍 Proxy endpoint: http://localhost:${PORT}/api/proxy?url=YOUR_URL`);
+  console.log(`📍 Proxy : http://localhost:${PORT}/api/proxy?url=YOUR_URL`);
+  console.log(`📍 Run   : POST http://localhost:${PORT}/api/run`);
 });
