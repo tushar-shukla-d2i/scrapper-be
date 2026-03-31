@@ -190,7 +190,8 @@ function getSelectorToolHtml(baseUrl) {
               if (!isSafeToggle) {
                 // Real navigation to another page — block it
                 e.preventDefault();
-                e.stopPropagation();
+                // We REMOVED e.stopPropagation() so that custom JS UI frameworks 
+                // still receive the click event and can open their dropdowns normally
               }
               // Hash/javascript links: let through so dropdown/toggle works
               return;
@@ -218,6 +219,30 @@ function getSelectorToolHtml(baseUrl) {
   `;
 }
 
+// ─── Safe click: races click against navigation so context is never destroyed ──
+async function safeClick(page, selector) {
+  try {
+    // CRITICAL: waitForNavigation MUST be started BEFORE the click.
+    // If we await click() first and navigation fires during it, the context is
+    // already destroyed by the time we call waitForNavigation → the bug.
+    // Promise.all starts both simultaneously so we never miss the navigation event.
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }).catch(() => {}),
+      page.click(selector),
+    ]);
+  } catch (err) {
+    if (err.message && err.message.includes('Execution context was destroyed')) {
+      // Navigation already happened mid-click — just wait for the new page to settle
+      console.log('  [safeClick] context destroyed mid-click — waiting for navigation to settle');
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
+    } else {
+      throw err;
+    }
+  }
+  // Final settle: ensure DOM is fully ready after any navigation
+  await page.waitForFunction(() => document.readyState === 'complete', { timeout: 8000 }).catch(() => {});
+}
+
 // ─── Replay steps on Puppeteer page ──────────────────────────────────────────
 async function replaySteps(page, steps) {
   for (let i = 0; i < steps.length; i++) {
@@ -227,11 +252,7 @@ async function replaySteps(page, steps) {
       switch (action) {
         case 'click':
           await page.waitForSelector(selector, { timeout: 10000 });
-          await page.click(selector);
-          await Promise.race([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }),
-            delay(1000)
-          ]).catch(() => {});
+          await safeClick(page, selector);
           break;
         case 'type':
           await page.waitForSelector(selector, { timeout: 10000 });
@@ -265,11 +286,11 @@ async function replaySteps(page, steps) {
           await page.hover(selector);
           break;
         case 'press':
-          await page.keyboard.press(value || 'Enter');
-          await Promise.race([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }),
-            delay(1000)
-          ]).catch(() => {});
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }).catch(() => {}),
+            page.keyboard.press(value || 'Enter'),
+          ]);
+          await page.waitForFunction(() => document.readyState === 'complete', { timeout: 8000 }).catch(() => {});
           break;
         default:
           console.warn(`  unknown action: ${action} — skipping`);
@@ -282,26 +303,35 @@ async function replaySteps(page, steps) {
 }
 
 // ─── Extract fields from Puppeteer page ──────────────────────────────────────
-async function extractFields(page, extractionFields) {
-  if (extractionFields.length === 0) {
-    const bodyText = await page.evaluate(() => document.body.innerText?.slice(0, 5000));
-    return [{ page_text: bodyText }];
+async function extractFields(page, extractionFields, attempt = 1) {
+  try {
+    if (extractionFields.length === 0) {
+      const bodyText = await page.evaluate(() => document.body.innerText?.slice(0, 5000));
+      return [{ page_text: bodyText }];
+    }
+    await delay(500);
+    return await page.evaluate((fields) => {
+      const record = {};
+      fields.forEach(({ fieldName, selector, attr }) => {
+        try {
+          const el = document.querySelector(selector);
+          if (!el) { record[fieldName] = null; return; }
+          if (attr === 'href')      record[fieldName] = el.href || el.getAttribute('href');
+          else if (attr === 'src')  record[fieldName] = el.src  || el.getAttribute('src');
+          else if (attr)            record[fieldName] = el.getAttribute(attr);
+          else                      record[fieldName] = el.innerText?.trim() || el.textContent?.trim();
+        } catch { record[fieldName] = null; }
+      });
+      return [record];
+    }, extractionFields);
+  } catch (err) {
+    if (err.message && err.message.includes('Execution context was destroyed') && attempt <= 3) {
+      console.log(`  [extractFields] Context destroyed mid-eval — waiting to settle and retrying (Attempt ${attempt})`);
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 5000 }).catch(() => {});
+      return extractFields(page, extractionFields, attempt + 1);
+    }
+    throw err;
   }
-  await delay(500);
-  return await page.evaluate((fields) => {
-    const record = {};
-    fields.forEach(({ fieldName, selector, attr }) => {
-      try {
-        const el = document.querySelector(selector);
-        if (!el) { record[fieldName] = null; return; }
-        if (attr === 'href')      record[fieldName] = el.href || el.getAttribute('href');
-        else if (attr === 'src')  record[fieldName] = el.src  || el.getAttribute('src');
-        else if (attr)            record[fieldName] = el.getAttribute(attr);
-        else                      record[fieldName] = el.innerText?.trim() || el.textContent?.trim();
-      } catch { record[fieldName] = null; }
-    });
-    return [record];
-  }, extractionFields);
 }
 
 // ─── Build safe HTML (strip blocking tags, inject tool) ───────────────────────
@@ -384,13 +414,26 @@ app.post('/api/run', async (req, res) => {
   try {
     const browser = await puppeteer.launch({
       headless: false,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      ignoreHTTPSErrors: true,           // bypass HTTPS/HTTP security warnings
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-extensions',            // kills ad blockers → fixes ERR_BLOCKED_BY_CLIENT
+        '--disable-web-security',          // allow mixed HTTP/HTTPS content
+        '--allow-running-insecure-content',// don't block HTTP on HTTPS pages
+        '--ignore-certificate-errors',     // ignore SSL cert issues
+        '--disable-features=IsolateOrigins,site-per-process', // iframe compat
+        '--no-first-run',                  // skip first-run dialogs
+        '--no-default-browser-check',
+      ],
       defaultViewport: { width: 1280, height: 800 }
     });
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000, ignoreHTTPSErrors: true });
     await replaySteps(page, steps);
+    // Ensure page is fully settled after all steps (catches any trailing navigation)
+    await page.waitForFunction(() => document.readyState === 'complete', { timeout: 8000 }).catch(() => {});
     const results   = await extractFields(page, extractionFields);
     const sessionId = `session_${Date.now()}`;
     sessions[sessionId] = { browser, page };
@@ -410,6 +453,8 @@ app.post('/api/continue', async (req, res) => {
   console.log(`\n▶ /api/continue  session=${sessionId}  steps=${steps.length}`);
   try {
     await replaySteps(session.page, steps);
+    // Ensure page is fully settled after all steps (catches any trailing navigation)
+    await session.page.waitForFunction(() => document.readyState === 'complete', { timeout: 8000 }).catch(() => {});
     const results = await extractFields(session.page, extractionFields);
     res.json({ success: true, results, total: results.length, liveUrl: session.page.url() });
   } catch (err) {
